@@ -1,33 +1,122 @@
 name: Build pi-agent → ghcr.io
+
+# Builds the pi-agent image (pi as an RPC service + cumora CLI) and pushes it to
+# GHCR, tagged with the exact pi version plus :latest. Versions are pinned from
+# the npm registry, so every build is reproducible - no @latest inside the image.
 on:
   workflow_dispatch:
+    inputs:
+      pi_version:
+        description: "pi version to build (empty = newest on npm)"
+        required: false
+        default: ""
+      cumora_version:
+        description: "cumora version to build (empty = newest on npm)"
+        required: false
+        default: ""
+  schedule:
+    # Daily check for a new upstream pi release (03:23 UTC).
+    - cron: "23 3 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "entrypoint.sh"
+      - "pi-rpc.sh"
+      - ".github/workflows/docker-publish.yml"
+
 concurrency:
   group: pi-agent-publish
   cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - name: Resolve versions
+        id: v
+        env:
+          IN_PI: ${{ inputs.pi_version }}
+          IN_CUMORA: ${{ inputs.cumora_version }}
+        run: |
+          set -euo pipefail
+          npm_latest() {
+            curl -fsSL "https://registry.npmjs.org/$1/latest" \
+              | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4
+          }
+          PI="${IN_PI:-$(npm_latest '%40earendil-works%2Fpi-coding-agent')}"
+          CUMORA="${IN_CUMORA:-$(npm_latest 'cumora')}"
+          for v in "$PI" "$CUMORA"; do
+            case "$v" in
+              ''|*[!0-9.]*) echo "invalid version: '$v'" >&2; exit 1 ;;
+            esac
+          done
+          echo "pi=${PI}" >> "$GITHUB_OUTPUT"
+          echo "cumora=${CUMORA}" >> "$GITHUB_OUTPUT"
+          echo "resolved pi=${PI} cumora=${CUMORA}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if this pi version is already published
+        id: check
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          PI: ${{ steps.v.outputs.pi }}
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "${IMAGE}:${PI}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${IMAGE}:${PI} already published - nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.exists == 'false'
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.check.outputs.exists == 'false'
+
       - name: Build and push
+        if: steps.check.outputs.exists == 'false'
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            PI_VERSION=${{ steps.v.outputs.pi }}
+            CUMORA_VERSION=${{ steps.v.outputs.cumora }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.v.outputs.pi }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.v.outputs.pi }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### pi-agent image"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| pi | \`${{ steps.v.outputs.pi }}\` |"
+            echo "| cumora | \`${{ steps.v.outputs.cumora }}\` |"
+            echo "| already published | \`${{ steps.check.outputs.exists }}\` |"
+            echo "| image | \`${REGISTRY}/${IMAGE_NAME}:${{ steps.v.outputs.pi }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
